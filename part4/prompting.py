@@ -40,11 +40,21 @@ class PromptTemplate:
 
 
 class PromptingPipeline:
-    def __init__(self, model, tokenizer, template: Optional[PromptTemplate] = None, device: str = "cuda"):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        template: Optional[PromptTemplate] = None,
+        device: str = "cuda",
+        max_prompt_tokens: Optional[int] = None,
+        exemplars: Optional[List[Dict[str, Any]]] = None,
+    ):
         self.model = model.to(device) if hasattr(model, 'to') else model
         self.tokenizer = tokenizer
         self.template = template or PromptTemplate("basic")
         self.device = device
+        self.max_prompt_tokens = max_prompt_tokens
+        self.exemplars = exemplars or []
         self._setup_choice_tokens()
     
     def _setup_choice_tokens(self):
@@ -56,25 +66,80 @@ class PromptingPipeline:
                     self.choice_tokens[label] = token_ids[-1]
                     break
     
+    def _truncate_context_to_fit(
+        self, context: str, question: str, choices: List[str], max_len: int
+    ) -> str:
+        """Truncate context so that context + question + choices fits within max_len tokens."""
+        reserved = len(
+            self.tokenizer.encode(self.template.format("", question, choices))
+        )
+        max_context_tokens = max(1, max_len - reserved)
+        context_tokens = self.tokenizer.encode(context)
+        if len(context_tokens) <= max_context_tokens:
+            return context
+        context_tokens = context_tokens[-max_context_tokens:]
+        return self.tokenizer.decode(context_tokens)
+
+    def _format_choice_input(self, context: str, question: str, choice: str) -> str:
+        """Match fine-tuned format: same as MultipleChoiceQADataset._format_choice_input."""
+        return f"{context}\n\nQuestion: {question}\n\nAnswer: {choice}"
+
+    def _build_few_shot_prefix(self) -> str:
+        if not self.exemplars:
+            return ""
+        blocks = []
+        for ex in self.exemplars:
+            blocks.append(self._format_choice_input(ex["context"], ex["question"], ex["answer_text"]))
+        return "\n\n".join(blocks) + "\n\n"
+
+    def _score_choice_logprob(self, context: str, question: str, choice: str, max_len: int) -> float:
+        """Score choice by log P(choice | context + question + 'Answer: '). Matches fine-tune format."""
+        few_shot = self._build_few_shot_prefix()
+        prefix_fixed = f"\n\nQuestion: {question}\n\nAnswer: "
+        choice_ids = self.tokenizer.encode(choice)
+        fixed_ids = self.tokenizer.encode(few_shot + prefix_fixed)
+        max_context_tokens = max(1, max_len - len(fixed_ids) - len(choice_ids))
+        context_tokens = self.tokenizer.encode(context)
+        if len(context_tokens) > max_context_tokens:
+            context_tokens = context_tokens[-max_context_tokens:]
+        context_trunc = self.tokenizer.decode(context_tokens)
+        prefix = f"{few_shot}{context_trunc}{prefix_fixed}"
+        full = prefix + choice
+        prefix_ids = self.tokenizer.encode(prefix)
+        full_ids = self.tokenizer.encode(full)
+        if len(full_ids) > max_len:
+            full_ids = full_ids[:max_len]
+        if len(full_ids) <= len(prefix_ids):
+            return float("-inf")
+        input_ids = torch.tensor([full_ids[:-1]], device=self.device)
+        logits = self.model(input_ids)[0]
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        prefix_len = len(prefix_ids)
+        total_logprob = 0.0
+        for i, tid in enumerate(full_ids[1:]):
+            if i + 1 >= prefix_len:
+                total_logprob += log_probs[i, tid].item()
+        return total_logprob
+
     @torch.no_grad()
     def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
         self.model.eval()
-        prompt = self.template.format(context, question, choices)
-        input_ids = torch.tensor([self.tokenizer.encode(prompt)], device=self.device)
-        logits = self.model(input_ids)[:, -1, :]
-        
-        choice_labels = ["A", "B", "C", "D"][:len(choices)]
-        choice_logits = []
-        for label in choice_labels:
-            if label in self.choice_tokens:
-                choice_logits.append(logits[0, self.choice_tokens[label]].item())
-            else:
-                choice_logits.append(float("-inf"))
-        
-        choice_logits = torch.tensor(choice_logits)
-        probs = softmax(choice_logits, dim=-1)
+        max_len = getattr(self.model, "context_length", 512)
+        if self.max_prompt_tokens is not None:
+            max_len = min(max_len, self.max_prompt_tokens)
+        reserved = len(
+            self.tokenizer.encode(f"\n\nQuestion: {question}\n\nAnswer: ")
+        ) + 50
+        max_context_tokens = max(1, max_len - reserved)
+        context_tokens = self.tokenizer.encode(context)
+        if len(context_tokens) > max_context_tokens:
+            context = self.tokenizer.decode(context_tokens[-max_context_tokens:])
+        scores = [
+            self._score_choice_logprob(context, question, c, max_len)
+            for c in choices
+        ]
+        probs = softmax(torch.tensor(scores), dim=-1)
         prediction = probs.argmax().item()
-        
         if return_probs:
             return prediction, probs.tolist()
         return prediction

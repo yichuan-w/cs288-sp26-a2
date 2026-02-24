@@ -34,6 +34,8 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = False
     patience: Optional[int] = None
+    # DDP: rank 0 logs/saves; None = single process
+    ddp_rank: Optional[int] = None
 
 
 class Trainer:
@@ -92,13 +94,17 @@ class Trainer:
             num_batches += 1
         return total_loss / num_batches if num_batches > 0 else 0.0
     
-    def train(self) -> Dict[str, Any]:
+    def train(self, epoch_callback=None) -> Dict[str, Any]:
+        """Train for num_epochs. epoch_callback(epoch, train_loss, val_loss) called each epoch."""
         for epoch in range(self.config.num_epochs):
             train_loss = self.train_epoch()
             self.train_losses.append(train_loss)
+            val_loss = 0.0
             if self.val_dataloader:
                 val_loss = self.evaluate()
                 self.val_losses.append(val_loss)
+            if epoch_callback:
+                epoch_callback(epoch + 1, train_loss, val_loss)
         return {"train_losses": self.train_losses, "val_losses": self.val_losses}
 
 
@@ -112,3 +118,10 @@ def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: st
 
 def create_qa_loss_fn(device: str = "cuda") -> Callable:
     return lambda batch, model: compute_qa_loss(batch, model, device)
+
+
+def unwrap_ddp(model: nn.Module) -> nn.Module:
+    """Get the underlying model when wrapped in DistributedDataParallel."""
+    if hasattr(model, "module"):
+        return model.module
+    return model

@@ -84,14 +84,18 @@ class MultipleChoiceQADataset(Dataset):
         return cls(data, tokenizer, **kwargs)
 
 
-def create_pretraining_dataloader(file_path, tokenizer, batch_size=8, max_length=256, stride=None, shuffle=True, num_workers=0):
+def create_pretraining_dataloader(file_path, tokenizer, batch_size=8, max_length=256, stride=None, shuffle=True, num_workers=0, sampler=None):
     dataset = PretrainingDataset(file_path, tokenizer, max_length, stride)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    if sampler is not None:
+        shuffle = False
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers, pin_memory=True)
 
 
-def create_qa_dataloader(data, tokenizer, batch_size=4, max_length=256, num_choices=4, shuffle=True, num_workers=0):
+def create_qa_dataloader(data, tokenizer, batch_size=4, max_length=256, num_choices=4, shuffle=True, num_workers=0, sampler=None):
     if isinstance(data, (str, Path)):
         dataset = MultipleChoiceQADataset.from_json(data, tokenizer, max_length=max_length, num_choices=num_choices)
     else:
         dataset = MultipleChoiceQADataset(data, tokenizer, max_length=max_length, num_choices=num_choices)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    if sampler is not None:
+        shuffle = False
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler, num_workers=num_workers, pin_memory=True)
